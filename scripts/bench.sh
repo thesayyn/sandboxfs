@@ -19,8 +19,18 @@ fi
 LARGE_MB="${LARGE_MB:-100}"
 SMALL_COUNT="${SMALL_COUNT:-2000}"
 SMALL_KB="${SMALL_KB:-4}"
-WARMUP="${WARMUP:-3}"
-RUNS="${RUNS:-10}"
+COLD="${COLD:-0}"
+if [ "$COLD" = "1" ]; then
+  WARMUP="${WARMUP:-1}"
+  RUNS="${RUNS:-5}"
+  PREPARE_FLAG=(--prepare "sudo -n purge")
+  echo "==> COLD mode: \`sudo purge\` between every iteration. Authenticate first:"
+  sudo -v
+else
+  WARMUP="${WARMUP:-3}"
+  RUNS="${RUNS:-10}"
+  PREPARE_FLAG=()
+fi
 
 LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
@@ -48,14 +58,7 @@ cleanup() {
     mount | grep -q " on $MNT " || break
     sleep 0.2
   done
-  # Give the extension a moment to flush its op-count log on deactivate,
-  # then surface the counters here.
   sleep 0.5
-  echo
-  echo "=== weldfs op counts (from log) ==="
-  log show --info --last 30s --style compact --predicate 'subsystem == "weldfs"' 2>/dev/null \
-    | awk '/=== weldfs op counts ===/,0' \
-    | head -30
   rm -rf "$TMP" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -100,13 +103,17 @@ if ! cat "$MNT/large/blob.bin" > /dev/null 2>"$TMP/cat.err"; then
 fi
 echo "    ok"
 
+read_counters() {
+  cat "$MNT/__counters" 2>/dev/null
+}
+
 run_bench() {
   local label="$1"; shift
   local direct_cmd="$1"; shift
   local mount_cmd="$1"
   echo
   echo "=== $label ==="
-  hyperfine --warmup "$WARMUP" --runs "$RUNS" \
+  hyperfine --warmup "$WARMUP" --runs "$RUNS" "${PREPARE_FLAG[@]}" \
     --command-name "direct" "$direct_cmd" \
     --command-name "weldfs" "$mount_cmd"
 }
@@ -126,3 +133,7 @@ run_bench "Stat traversal" \
 run_bench "Full tree read" \
   "find $SRC -type f -print0 | xargs -0 cat > /dev/null" \
   "find $MNT -type f -print0 | xargs -0 cat > /dev/null"
+
+echo
+echo "=== weldfs op counts (cumulative, all benches) ==="
+read_counters | awk -F'\t' '{ printf("    %-22s %s\n", $1, $2) }'

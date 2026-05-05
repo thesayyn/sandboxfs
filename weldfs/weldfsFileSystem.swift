@@ -62,7 +62,12 @@ final class WeldFSItem: FSItem {
     var linkname: FSFileName?
 
     var backingPath: String?
+    /// If set, `read` calls this to get fresh bytes instead of using `data`.
+    /// Used for virtual debug files like __counters.
+    var dataProvider: (() -> Data)?
     private(set) var fileDescriptor: Int32 = -1
+    private(set) var mmapPtr: UnsafeMutableRawPointer?
+    private(set) var mmapLen: Int = 0
     private let openLock = NSLock()
 
     private static let itemLogger = Logger(subsystem: "weldfs", category: "Item")
@@ -109,16 +114,31 @@ final class WeldFSItem: FSItem {
             throw fs_errorForPOSIXError(err)
         }
         fileDescriptor = fd
+        // Map the whole file once; subsequent reads memcpy out of it instead
+        // of going through pread(2). Saves the kernel→user copy that pread
+        // does, leaving only one user-space memcpy into the FSKit buffer.
+        let size = Int(attributes.size)
+        if size > 0 {
+            let p = mmap(nil, size, PROT_READ, MAP_PRIVATE, fd, 0)
+            if p != MAP_FAILED {
+                mmapPtr = p
+                mmapLen = size
+            }
+        }
     }
 
-    /// No-op: we keep the fd open until the volume is torn down. See
+    /// No-op: we keep the fd + mapping until the volume is torn down. See
     /// `releaseBackingFile()` for actual cleanup.
     func closeBackingFile() {}
 
-    /// Close the cached fd, if any. Called at volume deactivation.
     func releaseBackingFile() {
         openLock.lock()
         defer { openLock.unlock() }
+        if let p = mmapPtr, mmapLen > 0 {
+            munmap(p, mmapLen)
+            mmapPtr = nil
+            mmapLen = 0
+        }
         if fileDescriptor >= 0 {
             close(fileDescriptor)
             fileDescriptor = -1
@@ -134,11 +154,26 @@ final class OpCounters {
     func bump(_ key: String) {
         lock.lock(); counts[key, default: 0] += 1; lock.unlock()
     }
+    func snapshot() -> [(String, Int)] {
+        lock.lock(); defer { lock.unlock() }
+        return counts.sorted { $0.value > $1.value }
+    }
     func snapshotAndReset() -> [(String, Int)] {
         lock.lock(); defer { lock.unlock() }
         let out = counts.sorted { $0.value > $1.value }
         counts.removeAll()
         return out
+    }
+    func reset() {
+        lock.lock(); counts.removeAll(); lock.unlock()
+    }
+    func renderText() -> Data {
+        let snap = snapshot()
+        var lines = ""
+        for (name, count) in snap {
+            lines += "\(name)\t\(count)\n"
+        }
+        return Data(lines.utf8)
     }
 }
 
@@ -178,6 +213,17 @@ final class WeldFSVolume: FSVolume {
             volumeName: FSFileName(string: "weldfs")
         )
         self.root.addItem(self.version)
+
+        // Virtual debug file: `cat /mnt/__counters` returns current op counts.
+        let countersItem = WeldFSItem(name: FSFileName(string: "__counters"))
+        countersItem.attributes.type = .file
+        countersItem.attributes.mode = UInt32(S_IFREG | 0b100_100_100)
+        countersItem.attributes.size = 0
+        countersItem.attributes.allocSize = 0
+        countersItem.dataProvider = { [weak self] in
+            self?.counters.renderText() ?? Data()
+        }
+        self.root.addItem(countersItem)
     }
 }
 
@@ -344,6 +390,17 @@ extension WeldFSVolume: FSVolume.Operations {
         guard let item = item as? WeldFSItem else {
             throw fs_errorForPOSIXError(POSIXError.EIO.rawValue)
         }
+        // Virtual files: refresh size and bump mtime so the kernel buffer
+        // cache (keyed by size+mtime) treats every stat as a new revision.
+        if let provider = item.dataProvider {
+            let size = UInt64(provider().count)
+            item.attributes.size = size
+            item.attributes.allocSize = size
+            var ts = timespec()
+            timespec_get(&ts, TIME_UTC)
+            item.attributes.modifyTime = ts
+            item.attributes.changeTime = ts
+        }
         return item.attributes
     }
 
@@ -434,7 +491,9 @@ extension WeldFSVolume: FSVolume.Operations {
                 itemType: item.attributes.type,
                 itemID: item.attributes.fileID,
                 nextCookie: FSDirectoryCookie(UInt64(idx + 1)),
-                attributes: attributes != nil ? item.attributes : nil
+                // Always provide attributes; some callers may use them to
+                // skip subsequent attributes() RPCs even when not requested.
+                attributes: item.attributes
             )
             // Buffer full: kernel will re-call with the last accepted cookie.
             if !accepted { break }
@@ -469,7 +528,9 @@ extension WeldFSVolume: FSVolume.ReadWriteOperations {
             throw fs_errorForPOSIXError(POSIXError.EIO.rawValue)
         }
 
-        if let data = item.data {
+        // Virtual files (e.g., __counters) compute fresh bytes on each read.
+        let inMemory: Data? = item.dataProvider?() ?? item.data
+        if let data = inMemory {
             let start = Int(offset)
             let available = max(0, data.count - start)
             let n = min(min(length, buffer.length), available)
@@ -486,6 +547,19 @@ extension WeldFSVolume: FSVolume.ReadWriteOperations {
 
         if item.fileDescriptor < 0 {
             try item.openBackingFile()
+        }
+
+        // Prefer mmap-cached data: skip the pread syscall and one of the data
+        // copies. Fall back to pread if mmap failed or the file is empty.
+        if let mmap = item.mmapPtr {
+            let start = Int(offset)
+            let available = max(0, item.mmapLen - start)
+            let n = min(min(length, buffer.length), available)
+            guard n > 0 else { return 0 }
+            _ = buffer.withUnsafeMutableBytes { dst in
+                memcpy(dst.baseAddress, mmap.advanced(by: start), n)
+            }
+            return n
         }
 
         let requested = min(length, buffer.length)
@@ -507,5 +581,15 @@ extension WeldFSVolume: FSVolume.ReadWriteOperations {
         item.attributes.size = UInt64(contents.count)
         item.attributes.allocSize = UInt64(contents.count)
         return contents.count
+    }
+}
+
+extension WeldFSVolume: FSVolume.AccessCheckOperations {
+    // Conform to advertise capability, then disable so the kernel skips
+    // calling our checkAccess at all. Default-allow falls through.
+    @objc var isAccessCheckInhibited: Bool { true }
+
+    func checkAccess(to item: FSItem, requestedAccess: FSVolume.AccessMask) async throws -> Bool {
+        return true
     }
 }
