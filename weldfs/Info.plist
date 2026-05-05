@@ -25,24 +25,24 @@
 		<dict/>
 		<key>FSPersonalities</key>
 		<dict>
-			<key>sandboxfsPersonality</key>
+			<key>weldfsPersonality</key>
 			<dict>
 				<key>FSName</key>
-				<string>sandboxfs</string>
+				<string>weldfsName</string>
 				<key>FSfileObjectsAreCaseSensitive</key>
 				<false/>
 			</dict>
 		</dict>
 		<key>FSRequiresSecurityScopedPathURLResources</key>
-		<false/>
-		<key>FSShortName</key>
-		<string>sandboxfs</string>
-		<key>FSSupportsBlockResources</key>
 		<true/>
+		<key>FSShortName</key>
+		<string>weldfs</string>
+		<key>FSSupportsBlockResources</key>
+		<false/>
 		<key>FSSupportsGenericURLResources</key>
 		<false/>
 		<key>FSSupportsPathURLs</key>
-		<false/>
+		<true/>
 		<key>FSSupportsServerURLs</key>
 		<false/>
 	</dict>
