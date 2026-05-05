@@ -94,6 +94,25 @@ extension. Most are platform/Xcode oddities, not bugs in the FS code itself.
 - Cross-volume hardlinks aren't supported (POSIX `EXDEV`). Cross-volume
   `clonefile(2)` either. Symlinks and per-file `pread` are the only practical
   ways to project files from another volume.
+- **`umount(8)` does not fire `FSVolume.unmount()` on the extension** in
+  macOS 26.4. Neither does it fire `deactivate()`. The kernel tears down
+  its mount-table entry without delegating to the extension. If you want
+  to dump state at unmount time, expose it via a virtual file inside the
+  mount instead (e.g., `cat $MNT/__counters`); a simple `dataProvider`
+  closure on an `FSItem` works.
+- The kernel buffer cache caches a virtual file's contents based on
+  `(size, mtime)`. To force re-reads of a "live" debug file, bump
+  `attributes.modifyTime` (and `changeTime`) to the current time on every
+  `attributes()` call, AND have `attributes()` recompute `size` from the
+  current data length.
+- `enumerateDirectory` must:
+  1. Iterate from `cookie.rawValue` (not 0) so the kernel can paginate.
+  2. Iterate over a **stably-ordered** snapshot (sort `directory.children.keys`)
+     so successive calls don't reorder entries mid-iteration.
+  3. Check `packEntry`'s return value — `false` means the kernel's pack
+     buffer is full; break and let the kernel call back with the
+     last-accepted cookie.
+  Skipping any of these, especially #3 with a populated dir, hangs `find`.
 
 ## Logging & debugging
 
@@ -126,25 +145,67 @@ extension. Most are platform/Xcode oddities, not bugs in the FS code itself.
 
 ### Measured numbers (macOS 26.4.1, M-series)
 
-End-to-end measurements with `hyperfine` comparing direct filesystem reads
-against the same files projected through this FSKit module. Code is
-optimized to the floor: backing fds cached for the volume's lifetime, no
-hot-path logging, manifest pre-stat'd. See `scripts/bench.sh`.
+After all optimizations applied (cached fd, `isOpenCloseInhibited`,
+read-only mount, capability flags, mmap-cached reads). See `scripts/bench.sh`.
 
-| Workload                    | Direct  | weldfs  | Slowdown |
-|-----------------------------|---------|---------|----------|
-| Sequential read (100 MiB)   | 11 ms   | 12 ms   | 1.05×    |
-| Many small files (2000×4K)  | 37 ms   | 378 ms  | 10.1×    |
-| Stat traversal              | 3.11 s  | 4.29 s  | 1.38×    |
-| Full tree read              | 52 ms   | 423 ms  | 8.0×     |
+| Workload                   | Direct (warm) | weldfs (warm) | Slowdown |
+|----------------------------|---------------|---------------|----------|
+| Sequential read (100 MiB)  | 11 ms         | 11 ms         | parity   |
+| Many small files (2000×4K) | 37 ms         | 92 ms         | 2.5×     |
+| Stat traversal             | 3.10 s        | 4.30 s        | 1.4×     |
+| Full tree read             | 52 ms         | 102 ms        | 2.0×     |
 
-Per-file cost breakdown for the many-small-files case: 378 ms / 2000 ≈
-**184 μs per file**. The actual `pread` of 4 KiB out of buffer cache is ~1 μs,
-so ~183 μs/file is pure XPC RPC. With three round-trips per file
-(`openItem`+`read`+`closeItem`), that works out to **~60 μs per kernel→
-extension hop**. This is the structural floor on the current API; the only
-way to go lower is to remove kernel→extension hops, which requires an
-fd-passthrough primitive analogous to Linux's `FUSE_PASSTHROUGH`.
+Cold cache (`hyperfine --prepare 'sudo purge'` between iterations):
+ratios actually *shrink* — 1.2×–1.5× across the board — because direct
+APFS loses its kernel-cache advantage when both sides have to fetch from
+disk.
+
+Per-syscall comparison via `xctrace` (a flat `os.stat()` loop on 20K
+files, profiled directly vs through weldfs):
+
+|                        | Direct (APFS) | weldfs    |
+|------------------------|---------------|-----------|
+| avg `stat64` duration  | 1.86 µs       | **1.33 µs** |
+
+So `stat64` itself is *faster* on weldfs (in-memory hash lookup beats
+APFS's on-disk B-tree for a 20K-entry directory). The 1.4× stat-traversal
+slowdown in the macro bench therefore can't be from `stat()`. It comes
+from `getdirentries`/`enumerateDirectory` and process-spawn overhead
+around the stat calls — those go through FSKit's RPC machinery on cold
+paths, and the macro bench's `find | xargs stat` pipeline forks heavily.
+
+**The 70 µs/RPC cost is a cold-path cost only.** In warm steady-state
+the kernel cache satisfies most calls without RPC'ing the extension at
+all, so per-syscall latency is competitive with native APFS. The
+remaining cost lives in directory enumeration and the kernel-side FSKit
+VFS bookkeeping that's not user-tunable.
+
+## Profiling with `xctrace` / Instruments
+
+- The default `System Trace` template uses **Windowed (5 s)** recording
+  mode. Even with `--time-limit 15s`, only the last 5 s of activity ends
+  up in the trace bundle. Either run a long workload that fills the whole
+  window, or live with the truncation.
+- A `find … | xargs stat` workload forks too aggressively for profiling.
+  In the trace, **`runningboardd` and `logd` end up consuming 99% of CPU**
+  doing process bookkeeping; the actual filesystem code is invisible.
+  Use one long-lived process making many syscalls instead — a Python
+  loop calling `os.stat()` is what `scripts/profile.sh` and
+  `scripts/compare.sh` use.
+- `sudo purge` (drops the unified buffer cache) takes 2–5 s itself. If
+  you use it in a tight benchmark loop the trace window mostly captures
+  purge waiting, not actual workload. Skip it for profiling; the warm
+  steady state is the interesting one anyway.
+- Killing a `bash` subshell does **not** kill its `find | xargs stat`
+  pipeline (separate processes outlive the parent shell). When the trap
+  unmounts the FS, those pipelines start hitting the now-unmounted
+  directory and emit `No such file or directory` errors. Cosmetic, not
+  a bug in the FS.
+- Stack samples in the trace are unsymbolicated PCs unless you have
+  dSYMs. System binaries (`libsystem_kernel.dylib`, kernel) have public
+  symbols; the syscall table includes nice names like `stat64`. For
+  scripted analysis, the `syscall` schema (count + duration per syscall)
+  is more useful than `time-sample`.
 
 ## SourceKit
 
